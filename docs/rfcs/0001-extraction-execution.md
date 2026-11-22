@@ -1,12 +1,28 @@
 # RFC 0001 Execução de extrações e persistência
 
-Estado: Parcialmente confirmado para o primeiro incremento do domínio. Data: 21/11/2026.
+Estado: Domínio e orquestração por portas implementados; integrações ainda propostas. Atualização: 22/11/2026.
 
-O plano delimita o contrato de execução entre o serviço de negócio em Spring e o worker Go, antes de conectar mensageria e processamento real. A direção proposta mantém os metadados e tentativas sob controle do serviço e atribui ao worker o processamento e o relato dos resultados. O primeiro incremento implementa a modelagem dos modos e trechos escolhidos; a etapa seguinte deverá testar a orquestração com dependências simuladas.
+O plano delimita o contrato de execução entre o serviço de negócio em Spring e o worker Go, antes de conectar mensageria e processamento real. O domínio representa os modos e trechos escolhidos, e a aplicação orquestra aquisição, produção, upload e confirmação por portas testadas com dependências simuladas. Metadados e tentativas permanecem sob responsabilidade da contraparte de negócio; nenhuma implementação remota foi adicionada.
 
 Após o merge e a autorização de continuidade, o primeiro incremento aplica D4/D6: resultado lógico único e validação de saída com frames e tamanho de ZIP positivos. Para D5 foram confirmados intervalo configurável e positivo, ordem cronológica e rejeição de sobreposições. O contrato de domínio exige modo explícito e ao menos um trecho [Start, End), com início incluído e fim excluído; trechos adjacentes são válidos. A validação não ordena nem une seleções. O modo de todos os frames exige intervalo de amostragem zero, pois esse parâmetro não se aplica a ele.
 
 Esta confirmação não fecha contratos de transporte, limites operacionais, recuperação ou integrações das etapas seguintes. A representação com `time.Duration` não promete precisão de FFmpeg nem decide como quadros serão mapeados para timestamps.
+
+## Aplicação testável
+
+`Executor.Execute` recebe `ExecutionRequest` com `JobID` e chave estável de aquisição. A porta `Coordinator` devolve uma `Assignment` com job autorizado e destino, ou um resultado já concluído. A atribuição é validada antes de abrir arquivos; o job precisa corresponder à solicitação e conter tentativa, origem e opções válidas. O destino não pode ter o mesmo bucket e chave do original, mesmo com outra versão. A seleção de trechos é copiada para não compartilhar seu armazenamento com o objeto devolvido pela coordenação.
+
+As quatro portas descrevem necessidades do consumidor: `Coordinator` adquire/confirma a execução; `SourceStorage` abre o original fixado; `ArchiveProcessor` extrai e compacta, devolvendo um stream e medições; `ArchiveStorage` consome esse stream e devolve o recibo do upload. Extrator e compactador ficam agrupados nessa porta para permitir processamento incremental sem expor uma coleção de frames ao caso de uso. Nenhuma dessas interfaces escolhe SDK, broker, formato de transporte ou binário.
+
+`ExecutionOutcome.Result` só é preenchido com resultado validado e referência compatível com o destino autorizado, ou com um resultado previamente aceito. `Confirmed` só fica verdadeiro após o aceite da coordenação ou reconhecimento desse resultado anterior. Erro de comunicação após upload preserva o resultado válido com `Confirmed=false`; erro de fechamento após confirmação preserva `Confirmed=true` e informa também a falha de limpeza. O chamador deve considerar ambos os campos e o erro, sem reexecutar automaticamente um job já confirmado.
+
+Cancelamento detectado após um upload válido também devolve o resultado com `Confirmed=false`, sem tentar `Complete` com contexto cancelado. Essa janela depende da recuperação remota de D8; confirmação durável vence cancelamento posterior, enquanto upload sozinho não representa conclusão oficial.
+
+Streams retornados pela origem e pelo processador pertencem ao executor e são fechados inclusive em falhas parciais e cancelamento. O stream do arquivo é fechado antes do original. A porta de armazenamento não assume sua propriedade. Falhas de fechamento são combinadas com a falha principal e permanecem reconhecíveis por `errors.Is`; o executor não remove objetos remotos para desfazer uma conclusão incerta.
+
+O contexto recebido é propagado às portas, com verificação de cancelamento entre etapas. Falhas de aquisição, tentativa indisponível/obsoleta, saída inválida e recibo incompatível interrompem o fluxo. O executor não faz retry, não cria IDs de tentativa, não classifica falhas como definitivas, não renova leases nem consulta persistência real. Depois de uma conclusão incerta, a recuperação deve consultar/reconciliar o estado e o artefato; repetir `Execute` não é, por si só, um protocolo de recuperação.
+
+Ausência de resultado no retorno não prova ausência de bytes remotos: um upload pode falhar ou devolver um recibo inválido depois de produzir efeitos. Confirmar disponibilidade, garantir unicidade e recuperar essa janela continuam sendo responsabilidades dos contratos remotos das etapas seguintes. Os testes de duplicatas verificam os desfechos contratados da porta de coordenação, sem simular uma garantia distribuída de execução única.
 
 ## Decisões para avaliação
 
@@ -26,7 +42,7 @@ PNG/JPEG continuam explícitos. Aliases ou formato padrão só precisam ser deci
 
 ## Contexto e escopo
 
-O worker já possui [domínio de extração](../../internal/domain/extraction/), [testes públicos](../../tests/domain/extraction/) e infraestrutura de observabilidade. O [bootstrap](../../cmd/main.go) ainda não consome trabalhos. Não há implementação de coordenação, armazenamento, extração ou persistência de negócio.
+O worker possui [domínio de extração](../../internal/domain/extraction/), [aplicação por portas](../../internal/application/extraction/), testes públicos de [domínio](../../tests/domain/extraction/) e [aplicação](../../tests/application/extraction/), além de observabilidade. O [bootstrap](../../cmd/main.go) ainda não consome trabalhos. Não há adapters reais de coordenação, armazenamento, extração ou persistência de negócio.
 
 `ExtractionOptions` distingue amostragem (`sampling`) e todos os frames (`all_frames`) com seleção explícita de trechos. `FrameInterval` é positivo no primeiro modo e zero no segundo. `VideoSegment.Validate` verifica início não negativo e fim posterior ao início; a seleção exige ordem cronológica e ausência de sobreposição. `ExtractionResult.Validate` exige quantidade de frames e tamanho de ZIP positivos, mantendo duração de processamento não negativa.
 
@@ -144,7 +160,7 @@ Cada etapa abaixo pode originar um PR próprio após aprovação do seu recorte.
 | Etapa | Entrega | Verificação esperada |
 |---|---|---|
 | 1 Entregue neste incremento | Domínio alinhado aos modos/trechos, unidade de resultado e critérios de sucesso de D4 a D6 | Testes table-driven de entradas válidas/inválidas, limites estruturais e compatibilidade com PNG/JPEG; a grade temporal do executor permanece pendente para a etapa 4 |
-| 2 | Caso de uso Go com portas mínimas definidas pelo consumidor, sem adapters externos, após D1 a D3 e a etapa 1 | Testar ordem das operações, cancelamento, erros de cada etapa, limpeza e separação entre resultado produzido e confirmação aceita |
+| 2 Entregue neste incremento | Caso de uso Go com quatro portas definidas pelo consumidor e sem adapters externos | Testes de ordem, contexto/cancelamento, erros por etapa, limpeza parcial, atribuições/recibos inválidos, resultado anterior e conclusão incerta |
 | 3 | Persistência/coordenação no serviço responsável, com operações idempotentes e recuperação | Testes de aquisição concorrente, expiração, renovação tardia, conclusão duplicada/conflitante e rejeição de tentativa antiga; sem transação aberta durante o processamento |
 | 4 | Adapters de extração, arquivo, armazenamento e coordenação, em PRs por integração, após os contratos e D9 | Testes de contrato com fixture aprovada, origem fixada, extração/ZIP sem manter todo o resultado em memória e falhas entre upload e confirmação |
 | 5 | Despacho durável, consumidor e ligação ao bootstrap, após a contraparte real, D7 e D8 | Injetar queda antes/depois da aquisição e da conclusão, redelivery, indisponibilidade, espera por tentativa vigente e recuperação conforme a política de ACK |
@@ -165,4 +181,4 @@ Dois cuidados atravessam as etapas: autenticação e limites de acesso das integ
 - Os modos de extração e critérios de sucesso são decididos antes de implementar suas regras; valores técnicos pendentes não são inventados.
 - A primeira implementação tem um recorte testável com dependências simuladas; o domínio permanece dependente somente da biblioteca padrão.
 
-A avaliação deve confirmar ou alterar as recomendações ainda pendentes da tabela de decisões. O estado parcialmente confirmado limita a autorização ao incremento descrito; o merge deste documento não autoriza automaticamente todas as implementações futuras.
+A avaliação deve confirmar ou alterar as recomendações ainda pendentes da tabela de decisões. Os incrementos entregues não comprovam as garantias dos serviços remotos nem autorizam automaticamente todas as implementações futuras.
