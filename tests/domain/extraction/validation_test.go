@@ -36,12 +36,11 @@ func TestObjectReferenceValidation(t *testing.T) {
 			want:   extraction.ErrInvalidObjectReference,
 		},
 	}
-	checkValidation(t, valid, cases)
+	checkValidation(t, func() extraction.ObjectReference { return valid }, cases)
 }
 
 // TestVideoSourceValidation checks video identity and nested object validation.
 func TestVideoSourceValidation(t *testing.T) {
-	valid := validJob().Source
 	cases := map[string]validationCase[extraction.VideoSource]{
 		"válido":              {},
 		"identificador opaco": {change: func(s *extraction.VideoSource) { s.VideoID = "video-custom-42" }},
@@ -62,17 +61,45 @@ func TestVideoSourceValidation(t *testing.T) {
 			want:   extraction.ErrInvalidID,
 		},
 	}
-	checkValidation(t, valid, cases)
+	checkValidation(t, func() extraction.VideoSource { return validJob().Source }, cases)
 }
 
 // TestExtractionOptionsValidation checks positive spacing and explicit formats.
 func TestExtractionOptionsValidation(t *testing.T) {
-	valid := validJob().Options
 	cases := map[string]validationCase[extraction.ExtractionOptions]{
 		"PNG":                          {},
 		"JPEG":                         {change: func(o *extraction.ExtractionOptions) { o.ImageFormat = extraction.ImageFormatJPEG }},
 		"intervalo de um nanossegundo": {change: func(o *extraction.ExtractionOptions) { o.FrameInterval = time.Nanosecond }},
 		"intervalo grande":             {change: func(o *extraction.ExtractionOptions) { o.FrameInterval = time.Duration(1<<63 - 1) }},
+		"todos os frames": {change: func(o *extraction.ExtractionOptions) {
+			o.Mode, o.FrameInterval = extraction.ExtractionModeAllFrames, 0
+		}},
+		"modo vazio": {
+			change: func(o *extraction.ExtractionOptions) { o.Mode = "" },
+			want:   extraction.ErrInvalidMode,
+		},
+		"modo desconhecido": {
+			change: func(o *extraction.ExtractionOptions) { o.Mode = "keyframes" },
+			want:   extraction.ErrInvalidMode,
+		},
+		"modo com caixa diferente": {
+			change: func(o *extraction.ExtractionOptions) { o.Mode = "SAMPLING" },
+			want:   extraction.ErrInvalidMode,
+		},
+		"modo com espaços": {
+			change: func(o *extraction.ExtractionOptions) { o.Mode = " sampling" },
+			want:   extraction.ErrInvalidMode,
+		},
+		"todos os frames com intervalo positivo": {
+			change: func(o *extraction.ExtractionOptions) { o.Mode = extraction.ExtractionModeAllFrames },
+			want:   extraction.ErrInvalidInterval,
+		},
+		"todos os frames com intervalo negativo": {
+			change: func(o *extraction.ExtractionOptions) {
+				o.Mode, o.FrameInterval = extraction.ExtractionModeAllFrames, -time.Second
+			},
+			want: extraction.ErrInvalidInterval,
+		},
 		"intervalo zero": {
 			change: func(o *extraction.ExtractionOptions) { o.FrameInterval = 0 },
 			want:   extraction.ErrInvalidInterval,
@@ -99,10 +126,10 @@ func TestExtractionOptionsValidation(t *testing.T) {
 		},
 		"valor zero": {
 			change: func(o *extraction.ExtractionOptions) { *o = extraction.ExtractionOptions{} },
-			want:   extraction.ErrInvalidInterval,
+			want:   extraction.ErrInvalidMode,
 		},
 	}
-	checkValidation(t, valid, cases)
+	checkValidation(t, func() extraction.ExtractionOptions { return validJob().Options }, cases)
 }
 
 // TestExtractionJobValidation checks attempt identity and nested validation.
@@ -137,6 +164,26 @@ func TestExtractionJobValidation(t *testing.T) {
 			change: func(j *extraction.ExtractionJob) { j.Options.FrameInterval = 0 },
 			want:   extraction.ErrInvalidInterval,
 		},
+		"modo inválido": {
+			change: func(j *extraction.ExtractionJob) { j.Options.Mode = "" },
+			want:   extraction.ErrInvalidMode,
+		},
+		"seleção inválida": {
+			change: func(j *extraction.ExtractionJob) { j.Options.Segments = nil },
+			want:   extraction.ErrInvalidSegments,
+		},
+		"trechos fora de ordem": {
+			change: func(j *extraction.ExtractionJob) {
+				j.Options.Segments = []extraction.VideoSegment{{Start: 2 * time.Second, End: 3 * time.Second}, {Start: 0, End: time.Second}}
+			},
+			want: extraction.ErrInvalidSegments,
+		},
+		"trechos sobrepostos": {
+			change: func(j *extraction.ExtractionJob) {
+				j.Options.Segments = []extraction.VideoSegment{{Start: 0, End: 2 * time.Second}, {Start: time.Second, End: 3 * time.Second}}
+			},
+			want: extraction.ErrInvalidSegments,
+		},
 		"formato inválido": {
 			change: func(j *extraction.ExtractionJob) { j.Options.ImageFormat = "gif" },
 			want:   extraction.ErrInvalidImageFormat,
@@ -146,7 +193,7 @@ func TestExtractionJobValidation(t *testing.T) {
 			want:   extraction.ErrInvalidID,
 		},
 	}
-	checkValidation(t, validJob(), cases)
+	checkValidation(t, validJob, cases)
 }
 
 // TestExtractionResultValidation checks archive identity and processing measurements.
@@ -161,10 +208,19 @@ func TestExtractionResultValidation(t *testing.T) {
 		ProcessingDuration: 2 * time.Second,
 	}
 	cases := map[string]validationCase[extraction.ExtractionResult]{
-		"válido": {},
-		"medidas zero": {change: func(r *extraction.ExtractionResult) {
-			r.FrameCount, r.ArchiveSizeBytes, r.ProcessingDuration = 0, 0, 0
+		"válido":       {},
+		"duração zero": {change: func(r *extraction.ExtractionResult) { r.ProcessingDuration = 0 }},
+		"saída mínima positiva": {change: func(r *extraction.ExtractionResult) {
+			r.FrameCount, r.ArchiveSizeBytes = 1, 1
 		}},
+		"zero frames": {
+			change: func(r *extraction.ExtractionResult) { r.FrameCount = 0 },
+			want:   extraction.ErrInvalidResult,
+		},
+		"ZIP vazio": {
+			change: func(r *extraction.ExtractionResult) { r.ArchiveSizeBytes = 0 },
+			want:   extraction.ErrInvalidResult,
+		},
 		"medidas grandes": {change: func(r *extraction.ExtractionResult) {
 			r.FrameCount, r.ArchiveSizeBytes, r.ProcessingDuration = 1<<63-1, 1<<63-1, time.Duration(1<<63-1)
 		}},
@@ -218,26 +274,19 @@ func TestExtractionResultValidation(t *testing.T) {
 			want:   extraction.ErrInvalidID,
 		},
 	}
-	checkValidation(t, valid, cases)
+	checkValidation(t, func() extraction.ExtractionResult { return valid }, cases)
 }
 
-func checkValidation[T interface {
-	comparable
-	Validate() error
-}](t *testing.T, valid T, cases map[string]validationCase[T]) {
+func checkValidation[T interface{ Validate() error }](t *testing.T, newValid func() T, cases map[string]validationCase[T]) {
 	t.Helper()
 	for name, test := range cases {
 		t.Run(name, func(t *testing.T) {
-			value := valid
+			value := newValid()
 			if test.change != nil {
 				test.change(&value)
 			}
-			before := value
 			if err := value.Validate(); !errors.Is(err, test.want) {
 				t.Fatalf("erro de validação = %v; esperado %v", err, test.want)
-			}
-			if value != before {
-				t.Fatal("validação alterou os valores fornecidos")
 			}
 		})
 	}
@@ -251,6 +300,11 @@ func validJob() extraction.ExtractionJob {
 			VideoID: "video-1",
 			Object:  extraction.ObjectReference{Bucket: "videos", Key: "videos/video-1/original.mp4"},
 		},
-		Options: extraction.ExtractionOptions{FrameInterval: time.Second, ImageFormat: extraction.ImageFormatPNG},
+		Options: extraction.ExtractionOptions{
+			Mode:          extraction.ExtractionModeSampling,
+			Segments:      []extraction.VideoSegment{{Start: 0, End: 10 * time.Second}},
+			FrameInterval: time.Second,
+			ImageFormat:   extraction.ImageFormatPNG,
+		},
 	}
 }
