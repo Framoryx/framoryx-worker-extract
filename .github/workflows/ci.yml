@@ -1,0 +1,295 @@
+name: CI do worker
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  workflow-validation:
+    name: Validação do workflow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Instalar validador do workflow
+        run: bash scripts/ci/install-tool.sh actionlint
+      - name: Validar sintaxe e expressões do workflow
+        run: actionlint
+      - name: Validar sintaxe dos scripts de CI
+        run: bash -n scripts/ci/check-coverage.sh scripts/ci/install-tool.sh
+
+  formatting:
+    name: Formatação Go
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Preparar Go do projeto
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Conferir formatação sem modificar arquivos
+        run: |
+          git ls-files -z '*.go' | xargs -0 gofmt -l > "$RUNNER_TEMP/unformatted.txt"
+          if [[ -s "$RUNNER_TEMP/unformatted.txt" ]]; then
+            printf 'Arquivos Go precisam de formatação:\n' >&2
+            cat "$RUNNER_TEMP/unformatted.txt"
+            exit 1
+          fi
+
+  static-analysis:
+    name: Análise estática Go
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Preparar Go do projeto
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Verificar código com go vet
+        run: go vet ./...
+
+  tests:
+    name: Testes e concorrência
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Preparar Go do projeto
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Executar testes e gerar cobertura dos pacotes internos
+        run: go test -count=1 -race -shuffle=on -coverpkg=./internal/... -coverprofile=coverage.out ./...
+      - name: Preservar relatório de cobertura
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: relatorio-cobertura
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 7
+
+  coverage:
+    name: Cobertura mínima de 80%
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Recuperar relatório produzido pelos testes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: relatorio-cobertura
+      - name: Bloquear cobertura ausente, inválida ou inferior a 80%
+        run: bash scripts/ci/check-coverage.sh coverage.out
+
+  build:
+    name: Compilação do worker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Preparar Go do projeto
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Compilar executável
+        run: go build -trimpath -o dist/framoryx-worker-extract ./cmd
+      - name: Preservar executável
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: binario-worker
+          path: dist/framoryx-worker-extract
+          if-no-files-found: error
+          retention-days: 7
+
+  secrets:
+    name: Segredos no histórico Git
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Obter histórico completo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Instalar Gitleaks
+        run: bash scripts/ci/install-tool.sh gitleaks
+      - name: Bloquear segredos no histórico completo
+        run: |
+          mkdir -p reports
+          gitleaks git --log-opts=--all --redact=100 --no-banner --report-format=json --report-path=reports/gitleaks.json .
+      - name: Preservar relatório com segredos ocultos
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: gitleaks-historico
+          path: reports/gitleaks.json
+          if-no-files-found: error
+          retention-days: 7
+
+  dependencies:
+    name: Vulnerabilidades das dependências
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Instalar Trivy
+        run: bash scripts/ci/install-tool.sh trivy
+      - name: Bloquear vulnerabilidades HIGH e CRITICAL
+        run: |
+          mkdir -p reports
+          trivy fs --no-progress --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format json --output reports/trivy-dependencies.json .
+      - name: Preservar relatório de dependências
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: trivy-dependencias
+          path: reports/trivy-dependencies.json
+          if-no-files-found: error
+          retention-days: 7
+
+  executable-security:
+    name: Vulnerabilidades do executável
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Recuperar executável compilado
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: binario-worker
+          path: dist
+      - name: Instalar Trivy
+        run: bash scripts/ci/install-tool.sh trivy
+      - name: Bloquear vulnerabilidades do binário e da biblioteca padrão
+        run: |
+          mkdir -p reports
+          test -s dist/framoryx-worker-extract
+          chmod u+x dist/framoryx-worker-extract
+          trivy rootfs --no-progress --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format json --output reports/trivy-executable.json dist
+          python3 - <<'PY'
+          import json
+          import sys
+
+          with open("reports/trivy-executable.json", encoding="utf-8") as report:
+              results = json.load(report).get("Results", [])
+          libraries = [package for result in results if result.get("Type") == "gobinary" for package in result.get("Packages", [])]
+          if not any(package.get("Name") == "stdlib" and package.get("Version") for package in libraries):
+              print("O scanner não reconheceu o executável Go e sua biblioteca padrão; verificação reprovada.", file=sys.stderr)
+              sys.exit(1)
+          PY
+      - name: Preservar relatório do executável
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: trivy-executavel
+          path: reports/trivy-executable.json
+          if-no-files-found: error
+          retention-days: 7
+
+  infrastructure:
+    name: Configuração de infraestrutura
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Instalar Trivy
+        run: bash scripts/ci/install-tool.sh trivy
+      - name: Verificar configurações aplicáveis
+        run: |
+          mkdir -p reports
+          trivy config --severity HIGH,CRITICAL --exit-code 1 --format json --output reports/trivy-config.json .
+      - name: Preservar relatório de configuração
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: trivy-configuracao
+          path: reports/trivy-config.json
+          if-no-files-found: error
+          retention-days: 7
+
+  required-checks:
+    name: Verificações internas obrigatórias
+    if: always()
+    needs:
+      - workflow-validation
+      - formatting
+      - static-analysis
+      - tests
+      - coverage
+      - build
+      - secrets
+      - dependencies
+      - executable-security
+      - infrastructure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Exigir sucesso de todas as verificações internas
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          results = json.loads(os.environ["JOB_RESULTS"])
+          if not results:
+              print("Resultados dos jobs obrigatórios ausentes.", file=sys.stderr)
+              sys.exit(1)
+          failures = {name: job["result"] for name, job in results.items() if job["result"] != "success"}
+          if failures:
+              print("Verificações internas não aprovadas:", failures, file=sys.stderr)
+              sys.exit(1)
+          print("Todas as verificações internas obrigatórias foram aprovadas.")
+          PY
