@@ -23,7 +23,10 @@ func (e *Executor) Execute(ctx context.Context, request ExecutionRequest) (Execu
 	if !e.ready() {
 		return ExecutionOutcome{}, ErrInvalidDependencies
 	}
-	if err := request.validate(ctx); err != nil {
+	if ctx == nil {
+		return ExecutionOutcome{}, ErrInvalidRequest
+	}
+	if err := request.validate(); err != nil {
 		return ExecutionOutcome{}, err
 	}
 	assignment, err := runStage(ctx, "adquirir tentativa", func(ctx context.Context) (Assignment, error) {
@@ -81,11 +84,14 @@ func (e *Executor) runAssigned(ctx context.Context, job domain.ExtractionJob, de
 	if err != nil {
 		return outcome, err
 	}
-	outcome.Confirmed, err = runStage(ctx, "confirmar resultado", func(ctx context.Context) (bool, error) {
-		err := e.coordinator.Complete(ctx, *outcome.Result)
-		return err == nil, err
-	})
-	return outcome, err
+	if err := ctx.Err(); err != nil {
+		return outcome, err
+	}
+	if err := e.coordinator.Complete(ctx, *outcome.Result); err != nil {
+		return outcome, fmt.Errorf("confirmar resultado: %w", err)
+	}
+	outcome.Confirmed = true
+	return outcome, nil
 }
 
 func closeResource(resource io.Closer, operation string, executionErr *error) {
