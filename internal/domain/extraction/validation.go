@@ -37,6 +37,18 @@ func (s VideoSegment) Validate() error {
 
 // Validate checks the mode, sampling spacing, encoding and ordered disjoint segments.
 func (o ExtractionOptions) Validate() error {
+	if err := o.validateMode(); err != nil {
+		return err
+	}
+	switch o.ImageFormat {
+	case ImageFormatPNG, ImageFormatJPEG:
+	default:
+		return ErrInvalidImageFormat
+	}
+	return validateSegments(o.Segments)
+}
+
+func (o ExtractionOptions) validateMode() error {
 	switch o.Mode {
 	case ExtractionModeSampling:
 		if o.FrameInterval <= 0 {
@@ -49,19 +61,18 @@ func (o ExtractionOptions) Validate() error {
 	default:
 		return ErrInvalidMode
 	}
-	switch o.ImageFormat {
-	case ImageFormatPNG, ImageFormatJPEG:
-	default:
-		return ErrInvalidImageFormat
-	}
-	if len(o.Segments) == 0 {
+	return nil
+}
+
+func validateSegments(segments []VideoSegment) error {
+	if len(segments) == 0 {
 		return fmt.Errorf("ao menos um trecho é obrigatório: %w", ErrInvalidSegments)
 	}
-	for i, segment := range o.Segments {
+	for i, segment := range segments {
 		if err := segment.Validate(); err != nil {
 			return fmt.Errorf("trecho %d: %w", i, err)
 		}
-		if i > 0 && segment.Start < o.Segments[i-1].End {
+		if i > 0 && segment.Start < segments[i-1].End {
 			return fmt.Errorf("trechos devem estar em ordem cronológica e sem sobreposição: %w", ErrInvalidSegments)
 		}
 	}
