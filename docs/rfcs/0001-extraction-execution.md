@@ -1,8 +1,12 @@
 # RFC 0001 Execução de extrações e persistência
 
-Estado: Proposta para avaliação. Data: 21/11/2026.
+Estado: Parcialmente confirmado para o primeiro incremento do domínio. Data: 21/11/2026.
 
-O próximo incremento proposto é definir o contrato de execução entre o serviço de negócio em Spring e o worker Go, antes de conectar mensageria e processamento real. O serviço controla os metadados e as tentativas; o worker processa os arquivos e informa resultados. A primeira implementação posterior deve alinhar o domínio aos modos de extração escolhidos e testar a orquestração com dependências simuladas.
+O plano delimita o contrato de execução entre o serviço de negócio em Spring e o worker Go, antes de conectar mensageria e processamento real. A direção proposta mantém os metadados e tentativas sob controle do serviço e atribui ao worker o processamento e o relato dos resultados. O primeiro incremento implementa a modelagem dos modos e trechos escolhidos; a etapa seguinte deverá testar a orquestração com dependências simuladas.
+
+Após o merge e a autorização de continuidade, o primeiro incremento aplica D4/D6: resultado lógico único e validação de saída com frames e tamanho de ZIP positivos. Para D5 foram confirmados intervalo configurável e positivo, ordem cronológica e rejeição de sobreposições. O contrato de domínio exige modo explícito e ao menos um trecho [Start, End), com início incluído e fim excluído; trechos adjacentes são válidos. A validação não ordena nem une seleções. O modo de todos os frames exige intervalo de amostragem zero, pois esse parâmetro não se aplica a ele.
+
+Esta confirmação não fecha contratos de transporte, limites operacionais, recuperação ou integrações das etapas seguintes. A representação com `time.Duration` não promete precisão de FFmpeg nem decide como quadros serão mapeados para timestamps.
 
 ## Decisões para avaliação
 
@@ -11,9 +15,9 @@ O próximo incremento proposto é definir o contrato de execução entre o servi
 | D1 Propriedade dos dados | Serviço Spring persiste metadados e transições; alternativa de dois escritores não recomendada | Mantém consistente o bloqueio de expiração manual com trabalhos pendentes; necessária antes da coordenação |
 | D2 Retorno de execução | HTTP com consulta e repetição idempotentes; eventos de resultado como alternativa | HTTP depende da disponibilidade do serviço; eventos exigem recuperação durável da publicação e consumo idempotente |
 | D3 Identidade de tentativa | Serviço atribui a tentativa na aquisição; worker gera somente uma chave estável para repetir essa aquisição | Duplicatas de entrega não viram novas tentativas; necessária antes das portas de coordenação |
-| D4 Unidade de resultado | Um ZIP por solicitação contendo os frames de todos os trechos; alternativa de ZIPs por trecho | Decide a cardinalidade de resultados, hoje singular no domínio; necessária antes de ampliar `ExtractionResult` |
-| D5 Amostragem e todos os frames | Modos explícitos com seleção de trechos; decidir frequência fixa/configurável, precisão, ordenação e sobreposições | Preserva os dois modos e múltiplos trechos previstos no produto; necessária antes de ampliar `ExtractionOptions` |
-| D6 Critério de sucesso | Rejeitar zero frames e ZIP com tamanho zero; alternativa de resultado vazio exige regra explícita | A validação atual não impõe essa regra; necessária antes do caso de uso e do aceite de conclusão |
+| D4 Unidade de resultado | Confirmado para o incremento: um ZIP por solicitação com todos os trechos | Modelo mantém resultado lógico singular; a unicidade oficial por job depende da persistência/coordenação da etapa 3; geração do ZIP ainda será implementada |
+| D5 Amostragem e todos os frames | Confirmados modos explícitos, frequência configurável e positiva, ordem cronológica e ausência de sobreposição | Implementados na validação do domínio; precisão operacional e limites de produto permanecem pendentes |
+| D6 Critério de sucesso | Confirmado para o incremento: rejeitar zero frames e ZIP com tamanho zero | Implementado na validação de resultado; não prova existência ou integridade física do objeto |
 | D7 Confirmação do broker | Inicialmente após resultado ou falha definitiva aceitos duravelmente; aquisição com ACK antecipado é alternativa condicionada a recuperação durável | Exige compatibilidade entre tempo do trabalho e janela de entrega; necessária antes do consumidor real |
 | D8 Recuperação e repetição | Separar recuperação de execução interrompida de repetição de falha; definir classificação, limite de tentativas e destino de mensagens inválidas | A retomada de trabalhos aceitos precisa de garantia durável; novas tentativas automáticas de falhas continuam pendentes |
 | D9 Referência dos arquivos | Original fixado e destino exclusivo/recuperável por job e tentativa; alternativa depende de controle equivalente | Evita processar conteúdo alterado e sobrescrever resultado oficial; necessária antes do armazenamento |
@@ -24,9 +28,11 @@ PNG/JPEG continuam explícitos. Aliases ou formato padrão só precisam ser deci
 
 O worker já possui [domínio de extração](../../internal/domain/extraction/), [testes públicos](../../tests/domain/extraction/) e infraestrutura de observabilidade. O [bootstrap](../../cmd/main.go) ainda não consome trabalhos. Não há implementação de coordenação, armazenamento, extração ou persistência de negócio.
 
-`ExtractionOptions.FrameInterval` representa amostragem por intervalo, mas o produto também prevê todos os frames de um ou mais trechos. O contrato precisa distinguir esses modos antes de ser exposto em mensagens ou APIs. A validação atual aceita medidas zero no resultado; ela ainda não estabelece o critério de sucesso do processamento.
+`ExtractionOptions` distingue amostragem (`sampling`) e todos os frames (`all_frames`) com seleção explícita de trechos. `FrameInterval` é positivo no primeiro modo e zero no segundo. `VideoSegment.Validate` verifica início não negativo e fim posterior ao início; a seleção exige ordem cronológica e ausência de sobreposição. `ExtractionResult.Validate` exige quantidade de frames e tamanho de ZIP positivos, mantendo duração de processamento não negativa.
 
-Esta entrega propõe responsabilidades, garantias e uma sequência de implementação. Não altera código, dependências ou infraestrutura. A aprovação de uma direção arquitetural não define automaticamente os parâmetros de produto que aparecem como pendentes neste RFC.
+O domínio verifica a estrutura dos trechos, sem consultar a duração real do vídeo; a compatibilidade com a mídia de origem será validada na execução. As demais seções continuam propondo responsabilidades, garantias e sequência de implementação, sem alterar dependências ou infraestrutura. A aprovação de uma direção arquitetural não define automaticamente os parâmetros de produto que aparecem como pendentes neste RFC.
+
+A grade de amostragem, incluindo se reinicia no início de cada trecho ou segue uma referência global, permanece pendente para a etapa 4. Um intervalo maior que o trecho continua representável; o executor deverá aplicar a convenção definida e verificar se há quadros selecionáveis. O início incluído é uma fronteira temporal, não a garantia de existir um quadro exatamente nesse timestamp. Sem frames, o resultado não pode ser aceito como concluído.
 
 As seções de responsabilidades, persistência e coordenação descrevem um contrato entre aplicações; a ordem de implementação delimita o trabalho interno do worker e a contraparte necessária. A localização em `docs/rfcs/` é provisória: a organização oficial da documentação e o repositório do serviço Spring ainda precisam ser definidos. Publicar aqui permite revisar o contrato junto ao código existente, sem determinar a quantidade de serviços nem substituir uma visão C4 do sistema.
 
@@ -137,7 +143,7 @@ Cada etapa abaixo pode originar um PR próprio após aprovação do seu recorte.
 
 | Etapa | Entrega | Verificação esperada |
 |---|---|---|
-| 1 | Alinhar domínio e contrato lógico aos modos/trechos escolhidos, unidade de resultado e critérios de sucesso, após D4 a D6 | Testes table-driven de entradas válidas/inválidas, limites definidos e compatibilidade com PNG/JPEG |
+| 1 Entregue neste incremento | Domínio alinhado aos modos/trechos, unidade de resultado e critérios de sucesso de D4 a D6 | Testes table-driven de entradas válidas/inválidas, limites estruturais e compatibilidade com PNG/JPEG; a grade temporal do executor permanece pendente para a etapa 4 |
 | 2 | Caso de uso Go com portas mínimas definidas pelo consumidor, sem adapters externos, após D1 a D3 e a etapa 1 | Testar ordem das operações, cancelamento, erros de cada etapa, limpeza e separação entre resultado produzido e confirmação aceita |
 | 3 | Persistência/coordenação no serviço responsável, com operações idempotentes e recuperação | Testes de aquisição concorrente, expiração, renovação tardia, conclusão duplicada/conflitante e rejeição de tentativa antiga; sem transação aberta durante o processamento |
 | 4 | Adapters de extração, arquivo, armazenamento e coordenação, em PRs por integração, após os contratos e D9 | Testes de contrato com fixture aprovada, origem fixada, extração/ZIP sem manter todo o resultado em memória e falhas entre upload e confirmação |
@@ -159,4 +165,4 @@ Dois cuidados atravessam as etapas: autenticação e limites de acesso das integ
 - Os modos de extração e critérios de sucesso são decididos antes de implementar suas regras; valores técnicos pendentes não são inventados.
 - A primeira implementação tem um recorte testável com dependências simuladas; o domínio permanece dependente somente da biblioteca padrão.
 
-A avaliação deve confirmar ou alterar as recomendações da tabela de decisões. Pendências específicas podem permanecer abertas com suas etapas bloqueadas; o merge de documentação com estado Proposta não equivale à autorização de todas as implementações futuras.
+A avaliação deve confirmar ou alterar as recomendações ainda pendentes da tabela de decisões. O estado parcialmente confirmado limita a autorização ao incremento descrito; o merge deste documento não autoriza automaticamente todas as implementações futuras.
