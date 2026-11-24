@@ -52,6 +52,20 @@ docker compose logs --follow worker
 
 Este Compose não encaminha automaticamente stdout ao Loki. A presença da fonte Loki no Grafana não significa que os logs do worker já foram ingeridos. Também não há coleta automática de profiles; a auto-instrumentação eBPF está desabilitada.
 
+## Validar o ambiente
+
+Com Docker, Compose e Python 3 disponíveis:
+
+```sh
+python3 scripts/ci/check-compose.py
+```
+
+O script usa um projeto Compose com nome exclusivo e volume descartável. Ele verifica o bootstrap e as permissões do worker, envia uma métrica e um trace de conectividade por OTLP, consulta ambos pelo Grafana, encerra o worker por `SIGTERM` e verifica que uma pasta do Grafana persiste após recriar o container. Ao terminar, tenta preservar diagnósticos e remover exclusivamente os containers e volumes desse projeto de validação, inclusive em falhas. As portas alternativas `GRAFANA_PORT` e `OTLP_HTTP_PORT` também são respeitadas.
+
+Os sinais de teste usam o serviço `framoryx-compose-validation` e a métrica `framoryx.app.validation.connectivity`; não representam extrações de vídeo. A validação de ingestão exercita o receptor e as fontes de dados do backend. Ela não comprova que um consumidor ou um adapter de extração já esteja implementado no worker.
+
+Na CI, o script usa `--no-build` para executar a imagem construída e compartilhada como artefato entre os jobs, com checksum conferido. Os [jobs e gates da CI](docs/ci.md) verificam também as imagens Linux/amd64 e Linux/arm64, sem publicar em um registro.
+
 ## Encerrar e preservar os dados
 
 ```sh

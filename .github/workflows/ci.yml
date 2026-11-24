@@ -34,6 +34,20 @@ jobs:
         run: actionlint
       - name: Validar sintaxe dos scripts de CI
         run: bash -n scripts/ci/check-coverage.sh scripts/ci/install-tool.sh
+      - name: Validar sintaxe dos scripts de containers
+        run: python3 -m py_compile scripts/ci/check-go-report.py scripts/ci/check-compose.py
+
+  gate-tests:
+    name: Verificação dos gates de CI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Testar evidência de scan, rejeição OTLP e limpeza
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/ci -p '*_test.py'
 
   formatting:
     name: Formatação Go
@@ -213,17 +227,7 @@ jobs:
           test -s dist/framoryx-worker-extract
           chmod u+x dist/framoryx-worker-extract
           trivy rootfs --no-progress --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format json --output reports/trivy-executable.json dist
-          python3 - <<'PY'
-          import json
-          import sys
-
-          with open("reports/trivy-executable.json", encoding="utf-8") as report:
-              results = json.load(report).get("Results", [])
-          libraries = [package for result in results if result.get("Type") == "gobinary" for package in result.get("Packages", [])]
-          if not any(package.get("Name") == "stdlib" and package.get("Version") for package in libraries):
-              print("O scanner não reconheceu o executável Go e sua biblioteca padrão; verificação reprovada.", file=sys.stderr)
-              sys.exit(1)
-          PY
+          python3 scripts/ci/check-go-report.py reports/trivy-executable.json
       - name: Preservar relatório do executável
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -247,6 +251,7 @@ jobs:
       - name: Verificar configurações aplicáveis
         run: |
           mkdir -p reports
+          docker compose config --quiet
           trivy config --severity HIGH,CRITICAL --exit-code 1 --format json --output reports/trivy-config.json .
       - name: Preservar relatório de configuração
         if: always()
@@ -257,11 +262,148 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  image-build:
+    name: Build da imagem Linux/${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Preparar builder isolado
+        run: |
+          docker buildx create --name worker-ci --driver docker-container \
+            --driver-opt image=moby/buildkit:v0.35.1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c --use
+          docker buildx inspect --bootstrap
+      - name: Construir imagem e exportar arquivo Docker
+        run: |
+          docker buildx build --platform "linux/$TARGET_ARCH" \
+            --tag framoryx-worker-extract:local --output type=docker,dest=image.tar .
+      - name: Conferir plataforma e filesystem da imagem exportada
+        run: |
+          test -s image.tar
+          docker load --input image.tar
+          docker image inspect --format '{{json .}}' framoryx-worker-extract:local > image-inspect.json
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          with open("image-inspect.json", encoding="utf-8") as report:
+              image = json.load(report)
+          expected_architecture = os.environ["TARGET_ARCH"]
+          filesystem = image.get("RootFS", {})
+          valid = image.get("Os") == "linux" and image.get("Architecture") == expected_architecture
+          valid = valid and filesystem.get("Type") == "layers" and bool(filesystem.get("Layers"))
+          if not valid:
+              print("A plataforma ou o filesystem da imagem exportada não corresponde ao esperado.", file=sys.stderr)
+              sys.exit(1)
+          print("Imagem Linux/" + expected_architecture + " reconhecida com filesystem não vazio.")
+          PY
+          sha256sum image.tar > image.tar.sha256
+      - name: Preservar imagem exata e checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: imagem-worker-${{ matrix.arch }}
+          path: |
+            image.tar
+            image.tar.sha256
+            image-inspect.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Remover builder isolado
+        if: always()
+        run: |
+          if docker buildx inspect worker-ci > /dev/null 2>&1; then
+            docker buildx rm worker-ci
+          fi
+
+  image-security:
+    name: Vulnerabilidades da imagem Linux/${{ matrix.arch }}
+    needs: image-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Recuperar imagem exata da plataforma
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: imagem-worker-${{ matrix.arch }}
+      - name: Validar integridade do arquivo da imagem
+        run: sha256sum --check --strict image.tar.sha256
+      - name: Instalar Trivy
+        run: bash scripts/ci/install-tool.sh trivy
+      - name: Bloquear vulnerabilidades da imagem e comprovar análise Go
+        run: |
+          mkdir -p reports
+          trivy image --input image.tar --platform "linux/$TARGET_ARCH" --no-progress \
+            --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format json \
+            --output "reports/trivy-image-$TARGET_ARCH.json"
+          python3 scripts/ci/check-go-report.py "reports/trivy-image-$TARGET_ARCH.json"
+      - name: Preservar relatório da imagem
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: trivy-imagem-${{ matrix.arch }}
+          path: reports/trivy-image-${{ matrix.arch }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  compose-integration:
+    name: Integração real com Compose e Grafana
+    needs: image-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Obter código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Recuperar imagem AMD64 construída
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: imagem-worker-amd64
+      - name: Validar e carregar a imagem exata do teste
+        run: |
+          mkdir -p reports/compose
+          sha256sum --check --strict image.tar.sha256 | tee reports/compose/ci-image-checksum.txt
+          docker load --input image.tar | tee reports/compose/ci-image-load.log
+          docker image inspect --format '{{json .}}' framoryx-worker-extract:local > reports/compose/ci-image-inspect.json
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' framoryx-worker-extract:local)" = linux/amd64
+      - name: Verificar startup, OTLP, persistência e SIGTERM sem rebuild
+        run: python3 scripts/ci/check-compose.py --no-build --report-dir reports/compose
+      - name: Preservar evidências do ambiente Compose
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: integracao-compose
+          path: reports/compose
+          if-no-files-found: error
+          retention-days: 7
+
   required-checks:
     name: Verificações internas obrigatórias
     if: always()
     needs:
       - workflow-validation
+      - gate-tests
       - formatting
       - static-analysis
       - tests
@@ -271,6 +413,9 @@ jobs:
       - dependencies
       - executable-security
       - infrastructure
+      - image-build
+      - image-security
+      - compose-integration
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
