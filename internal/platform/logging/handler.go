@@ -55,11 +55,7 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 }
 
 func (h *Handler) WithGroup(name string) slog.Handler {
-	switch name {
-	case "traceId", "spanId", "correlationId", "requestId", "service":
-		return h
-	}
-	if name == "" {
+	if name == "" || reservedKey(name) {
 		return h
 	}
 	clone := *h
@@ -70,8 +66,7 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 func cleanAttrs(attrs []slog.Attr) []slog.Attr {
 	var clean []slog.Attr
 	for _, attr := range attrs {
-		switch attr.Key {
-		case "traceId", "spanId", "correlationId", "requestId", "service":
+		if reservedKey(attr.Key) {
 			continue
 		}
 		attr.Value = attr.Value.Resolve()
@@ -81,4 +76,13 @@ func cleanAttrs(attrs []slog.Attr) []slog.Attr {
 		clean = append(clean, attr)
 	}
 	return clean
+}
+
+func reservedKey(key string) bool {
+	switch key {
+	case "traceId", "spanId", "correlationId", "requestId", "service":
+		return true
+	default:
+		return false
+	}
 }
